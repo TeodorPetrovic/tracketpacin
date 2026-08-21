@@ -1,6 +1,7 @@
 import glob
 import os
 import random
+import re
 import uuid
 import xml.etree.ElementTree as ET
 
@@ -9,10 +10,20 @@ from profiles import PROFILE_LIBRARY
 
 def _discover_template_sources():
     base_dir = os.path.dirname(__file__)
-    patterns = [
-        os.path.join(base_dir, 'examples', '*.xml'),
-        os.path.join(base_dir, 'examples', 'more', '*.xml'),
+    roots = [
+        os.path.join(base_dir, 'templates', 'packettracer'),
+        # Keep backward compatibility with the old flat layout.
+        base_dir,
+        os.path.join(base_dir, 'examples'),
     ]
+    patterns = []
+    for root in roots:
+        patterns.extend([
+            os.path.join(root, '*_source.xml'),
+            os.path.join(root, '*_template.xml'),
+            os.path.join(root, '**', '*_source.xml'),
+            os.path.join(root, '**', '*_template.xml'),
+        ])
     sources = []
     for pattern in patterns:
         sources.extend(glob.glob(pattern))
@@ -20,11 +31,37 @@ def _discover_template_sources():
 
 
 EXTRA_TEMPLATE_SOURCES = [
+    # test.xml supplies the switch/PC templates; the base document is selected
+    # separately so a current Packet Tracer empty save can provide its format.
+    os.path.join('templates', 'packettracer', 'test.xml'),
+    os.path.join('test.xml'),
+    # The layouts use three-part GigabitEthernet names (0/0/0, 0/0/1).
+    # Prefer the PT8200 template, which exposes those ports, over legacy 1841
+    # or 1941 templates that only expose two-part GigabitEthernet names.
+    os.path.join('templates', 'packettracer', 'router_8200_source.xml'),
+    os.path.join('router_8200_source.xml'),
     os.path.join('examples', 'DHCPbasicAnswers.xml'),
     os.path.join('examples', 'DHCPwithVLANsAnswers.xml'),
     os.path.join('examples', 'SubnettingLab2Answers.xml'),
 ]
 EXTRA_TEMPLATE_SOURCES.extend(_discover_template_sources())
+
+
+def _base_template_path():
+    """Return the newest local Packet Tracer document used as the XML base."""
+    base_dir = os.path.dirname(__file__)
+    for filename in (
+        os.path.join('templates', 'packettracer', 'emptysavefile.xml'),
+        os.path.join('templates', 'packettracer', 'test.xml'),
+        'emptysavefile.xml',
+        'test.xml',
+    ):
+        candidate = os.path.join(base_dir, filename)
+        if os.path.exists(candidate):
+            return candidate
+    raise FileNotFoundError(
+        'No Packet Tracer base XML found; provide templates/packettracer/emptysavefile.xml.'
+    )
 
 
 class Lab:
@@ -45,6 +82,7 @@ class Lab:
         self._min_separation = 100
         self._rng = rng or random.Random()
         self._used_macs = set()
+        self._physical_context = None
 
     def unique_name(self, base):
         """Return a device name that is unique inside this lab."""
@@ -87,8 +125,8 @@ class Lab:
             'cluster_id': cluster_id,
         })
 
-    def add_device(self, name, device_type, position=None, profile=None):
-        """Register a device, optional logical position, and config profile."""
+    def add_device(self, name, device_type, position=None, profile=None, settings=None):
+        """Register a device, optional logical position, config profile, or host settings."""
         if any(device['name'] == name for device in self.devices):
             raise ValueError(f'Device name {name} already exists; use lab.unique_name() for collisions.')
         resolved_position = self._resolve_position(position)
@@ -97,6 +135,7 @@ class Lab:
             'type': device_type,
             'position': resolved_position,
             'profile': profile,
+            'settings': settings or {},
         }
         self.devices.append(info)
         self._device_lookup[name] = info
@@ -206,22 +245,21 @@ class Lab:
                 bia_elem.text = mac
 
     def to_packettracer_xml(self, path):
-        """Clone devices from test.xml so every generated file matches PT 8.2 layout."""
-        template_path = os.path.join(os.path.dirname(__file__), 'test.xml')
-        if not os.path.exists(template_path):
-            raise FileNotFoundError('test.xml not found; place a Packet Tracer 8.2 file next to this script.')
+        """Clone devices into the newest local Packet Tracer XML base."""
+        template_path = _base_template_path()
 
         tree = ET.parse(template_path)
         root = tree.getroot()
         template_version = root.findtext('VERSION')
+        self._physical_context = self._read_physical_context(root)
 
         network = root.find('NETWORK')
         if network is None:
-            raise ValueError('NETWORK section missing in test.xml')
+            raise ValueError('NETWORK section missing in the Packet Tracer base template')
 
         devices_elem = network.find('DEVICES')
         if devices_elem is None:
-            raise ValueError('DEVICES section missing in test.xml')
+            raise ValueError('DEVICES section missing in the Packet Tracer base template')
 
         template_map = self._collect_templates(devices_elem)
         self._ensure_extra_templates(template_map)
@@ -230,6 +268,8 @@ class Lab:
         device_refs = {}
         layout_tracker = {'switch': 0, 'pc': 0, 'router': 0, 'server': 0}
         physical_tracker = {'rack': 0, 'pc': 0}
+        device_indexes = {}
+        packet_tracer_9 = str(template_version or '').startswith('9.')
 
         for idx, dev_info in enumerate(self.devices):
             template = self._pick_template(dev_info['type'], template_map)
@@ -241,8 +281,11 @@ class Lab:
             self._randomize_device_macs(new_device)
             if dev_info.get('profile'):
                 self._apply_profile(new_device, dev_info)
+            if dev_info.get('settings'):
+                self._apply_settings(new_device, dev_info)
             save_ref = self._extract_save_ref(new_device)
             device_refs[dev_info['name']] = save_ref
+            device_indexes[dev_info['name']] = str(idx)
             devices_elem.append(new_device)
 
         links_elem = network.find('LINKS')
@@ -250,18 +293,45 @@ class Lab:
             links_elem = ET.SubElement(network, 'LINKS')
         links_elem.clear()
 
+        port_mem_addresses = {}
+
+        def endpoint_mem_addr(device_name, port_name):
+            key = (device_name, port_name)
+            if key not in port_mem_addresses:
+                port_mem_addresses[key] = 2582400000000 + len(port_mem_addresses) * 1000
+            return str(port_mem_addresses[key])
+
+        def device_dev_addr(device_name):
+            device = next((item for item in devices_elem.findall('DEVICE')
+                           if item.findtext('ENGINE/NAME', '') == device_name), None)
+            if device is None:
+                return '0'
+            return device.findtext('WORKSPACE/LOGICAL/DEV_ADDR', '0')
+
         for link in self.links:
             if link['dev1'] not in device_refs or link['dev2'] not in device_refs:
                 continue
             link_elem = ET.SubElement(links_elem, 'LINK')
             ET.SubElement(link_elem, 'TYPE').text = 'eCopper'
             cable = ET.SubElement(link_elem, 'CABLE')
-            ET.SubElement(cable, 'LENGTH').text = link['length']
-            ET.SubElement(cable, 'FUNCTIONAL').text = 'true'
-            ET.SubElement(cable, 'FROM').text = device_refs[link['dev1']]
+            ET.SubElement(cable, 'LENGTH').text = '0' if packet_tracer_9 else link['length']
+            if packet_tracer_9:
+                # PT 9 uses device indexes and rejects the older save-ref /
+                # FUNCTIONAL link representation as an incompatible file.
+                from_ref = device_indexes[link['dev1']]
+                to_ref = device_indexes[link['dev2']]
+            else:
+                ET.SubElement(cable, 'FUNCTIONAL').text = 'true'
+                from_ref = device_refs[link['dev1']]
+                to_ref = device_refs[link['dev2']]
+            ET.SubElement(cable, 'FROM').text = from_ref
             ET.SubElement(cable, 'PORT').text = link['port1']
-            ET.SubElement(cable, 'TO').text = device_refs[link['dev2']]
+            ET.SubElement(cable, 'TO').text = to_ref
             ET.SubElement(cable, 'PORT').text = link['port2']
+            ET.SubElement(cable, 'FROM_DEVICE_MEM_ADDR').text = device_dev_addr(link['dev1'])
+            ET.SubElement(cable, 'TO_DEVICE_MEM_ADDR').text = device_dev_addr(link['dev2'])
+            ET.SubElement(cable, 'FROM_PORT_MEM_ADDR').text = endpoint_mem_addr(link['dev1'], link['port1'])
+            ET.SubElement(cable, 'TO_PORT_MEM_ADDR').text = endpoint_mem_addr(link['dev2'], link['port2'])
             ET.SubElement(cable, 'TYPE').text = link['cable_type']
 
         self._rebuild_physical_workspace(root, devices_elem)
@@ -274,20 +344,18 @@ class Lab:
 
         ET.indent(tree, space=' ')
         tree.write(path, encoding='utf-8', xml_declaration=False, short_empty_elements=False)
-        print(f'Packet Tracer XML written to {path} using templates from test.xml')
+        print(f'Packet Tracer XML written to {path} using base {os.path.basename(template_path)}')
 
     def _load_template_map(self):
-        template_path = os.path.join(os.path.dirname(__file__), 'test.xml')
-        if not os.path.exists(template_path):
-            raise FileNotFoundError('test.xml not found; place a Packet Tracer 8.2 file next to this script.')
+        template_path = _base_template_path()
         tree = ET.parse(template_path)
         root = tree.getroot()
         network = root.find('NETWORK')
         if network is None:
-            raise ValueError('NETWORK section missing in test.xml')
+            raise ValueError('NETWORK section missing in the Packet Tracer base template')
         devices_elem = network.find('DEVICES')
         if devices_elem is None:
-            raise ValueError('DEVICES section missing in test.xml')
+            raise ValueError('DEVICES section missing in the Packet Tracer base template')
         template_map = self._collect_templates(devices_elem)
         self._ensure_extra_templates(template_map)
         return template_map
@@ -317,8 +385,17 @@ class Lab:
         templates = template_map.get(bucket, [])
         if not templates:
             raise ValueError(
-                f'No templates available for {bucket}; ensure test.xml or EXTRA_TEMPLATE_SOURCES provide one.'
+                f'No templates available for {bucket}; ensure templates/packettracer contains a suitable source.'
             )
+        if bucket == 'router':
+            # The scenario layouts use three-part GigabitEthernet interfaces.
+            # PT8200 is the installed template that exposes those interfaces;
+            # older 1841/1941/2811 templates do not match the generated links.
+            for template in templates:
+                model = (template.find('ENGINE/TYPE').get('model', '')
+                         if template.find('ENGINE/TYPE') is not None else '')
+                if model == 'PT8200':
+                    return template
         return templates[0]
 
     def _categorize_device(self, device_elem):
@@ -439,13 +516,9 @@ class Lab:
         lowered = device_type.lower()
         is_pc = lowered.startswith('pc') or lowered.startswith('server')
 
-        homerack_uuids = [
-            '866b072e-a242-4700-afc2-0d37fe0a38ac',
-            '0d9c4da0-a254-4b80-8ef1-0af23052ef86',
-            '940bdc5d-0715-4851-9c7b-6b1143f2af14',
-            '79d0e2b3-9fae-487a-bace-2862f6689a40',
-        ]
-        rack_uuid = 'f6f9f4d5-6f96-46ef-b2f9-2f831132fb17'
+        physical_context = self._physical_context or {}
+        homerack_uuids = physical_context.get('homerack_uuids') or []
+        rack_uuid = physical_context.get('rack_uuid') or str(uuid.uuid4())
 
         device_uuid = str(uuid.uuid4())
         if is_pc:
@@ -495,13 +568,9 @@ class Lab:
         if physicalworkspace is None:
             return
 
-        homerack_uuids = [
-            '866b072e-a242-4700-afc2-0d37fe0a38ac',
-            '0d9c4da0-a254-4b80-8ef1-0af23052ef86',
-            '940bdc5d-0715-4851-9c7b-6b1143f2af14',
-            '79d0e2b3-9fae-487a-bace-2862f6689a40',
-        ]
-        rack_uuid = 'f6f9f4d5-6f96-46ef-b2f9-2f831132fb17'
+        physical_context = self._physical_context or {}
+        homerack_uuids = physical_context.get('homerack_uuids') or []
+        rack_uuid = physical_context.get('rack_uuid') or str(uuid.uuid4())
 
         homerack = physicalworkspace.find('HOMERACK')
         if homerack is not None:
@@ -634,6 +703,38 @@ class Lab:
             else:
                 rack_children.append(node)
 
+    def _read_physical_context(self, root):
+        """Read physical-workspace UUIDs from the selected Packet Tracer base.
+
+        Packet Tracer validates these UUID references. They differ between
+        saved files, so using constants from an older template corrupts the
+        physical workspace in newer Packet Tracer releases.
+        """
+        physicalworkspace = root.find('PHYSICALWORKSPACE')
+        if physicalworkspace is None:
+            return {}
+
+        by_type = {}
+        rack_uuid = None
+        for node in physicalworkspace.findall('.//NODE'):
+            node_type = node.findtext('TYPE', '').strip()
+            uuid_text = node.findtext('UUID_STR', '').strip().strip('{}')
+            if not uuid_text:
+                continue
+            if node_type in {'0', '1', '2', '3'}:
+                by_type[node_type] = uuid_text
+            elif node_type == '4' and rack_uuid is None:
+                rack_uuid = uuid_text
+
+        homerack_uuids = [by_type.get(node_type) for node_type in ('0', '1', '2', '3')]
+        if not all(homerack_uuids):
+            return {}
+
+        return {
+            'homerack_uuids': homerack_uuids,
+            'rack_uuid': rack_uuid or str(uuid.uuid4()),
+        }
+
     def _inject_instruction_note(self, root):
         if not self._instruction_note_text and not self._site_labels:
             return
@@ -727,7 +828,7 @@ class Lab:
             raise ValueError('Device template missing ENGINE block')
         save_ref = engine.find('SAVE_REF_ID')
         if save_ref is None or not save_ref.text:
-            raise ValueError('Device template missing SAVE_REF_ID; test.xml must include one')
+            raise ValueError('Device template missing SAVE_REF_ID; the source template must include one')
         return save_ref.text
 
     def _deep_copy_element(self, elem):
@@ -746,7 +847,7 @@ class Lab:
 
         profiles = []
         for profile_name in profile_names:
-            profile = PROFILE_LIBRARY.get(profile_name)
+            profile = profile_name if isinstance(profile_name, dict) else PROFILE_LIBRARY.get(profile_name)
             if profile is None:
                 raise ValueError(f'Profile {profile_name} is not defined')
             expected = profile.get('device_type')
@@ -764,9 +865,76 @@ class Lab:
         if running_blocks:
             merged_running = '\n'.join(block.strip('\n') for block in running_blocks)
             self._write_config_section(engine, 'RUNNINGCONFIG', merged_running)
+            self._sync_ios_interface_ports(engine, merged_running)
         if startup_blocks:
             merged_startup = '\n'.join(block.strip('\n') for block in startup_blocks)
             self._write_config_section(engine, 'STARTUPCONFIG', merged_startup)
+
+    def _sync_ios_interface_ports(self, engine_elem, config_text):
+        """Mirror IOS IPv4 interface state into Packet Tracer PORT records.
+
+        Router configuration is represented twice in a PT save file: as IOS
+        lines and as the simulated interface's native PORT fields.  The
+        former is what the CLI displays, while the latter is what the
+        simulator and activity answer network use for addressing.  Generated
+        router templates can contain a default address, so leaving the PORT
+        block untouched produces an answer file whose CLI looks correct but
+        whose network still behaves as the template network.
+        """
+        ports = list(engine_elem.findall('.//PORT'))
+        if not ports:
+            return
+
+        by_kind = {}
+        for port in ports:
+            port_type = (port.findtext('TYPE') or '').lower()
+            if 'coppergigabitethernet' in port_type:
+                kind = 'gigabitethernet'
+            elif 'copperfastethernet' in port_type:
+                kind = 'fastethernet'
+            elif 'serial' in port_type:
+                kind = 'serial'
+            elif 'ethernet' in port_type:
+                kind = 'ethernet'
+            else:
+                continue
+            by_kind.setdefault(kind, []).append(port)
+
+        def port_for_interface(interface_name):
+            lowered = interface_name.lower()
+            kind = next((candidate for candidate in by_kind if lowered.startswith(candidate)), None)
+            if kind is None:
+                return None
+            candidates = by_kind[kind]
+            # IOS interface names in the supplied PT templates use the final
+            # numeric component as the physical port index (G0/0/0 -> 0,
+            # G0/0/1 -> 1, FastEthernet0 -> 0).
+            match = re.search(r'(\d+)(?:\D*)$', interface_name)
+            index = int(match.group(1)) if match else 0
+            return candidates[index] if index < len(candidates) else None
+
+        current_port = None
+        for raw in config_text.splitlines():
+            line = raw.strip()
+            if line.lower().startswith('interface '):
+                current_port = port_for_interface(line.split(None, 1)[1])
+                continue
+            if current_port is None:
+                continue
+            if line.lower().startswith('ip address '):
+                fields = line.split()
+                if len(fields) >= 4:
+                    ip = current_port.find('IP')
+                    subnet = current_port.find('SUBNET')
+                    if ip is not None:
+                        ip.text = fields[2]
+                    if subnet is not None:
+                        subnet.text = fields[3]
+            elif line.lower() == 'no ip address':
+                for tag in ('IP', 'SUBNET', 'PORT_GATEWAY', 'PORT_DNS'):
+                    element = current_port.find(tag)
+                    if element is not None:
+                        element.text = ''
 
     def _write_config_section(self, engine_elem, section_name, config_text):
         section = engine_elem.find(section_name)
@@ -776,3 +944,48 @@ class Lab:
         for line in config_text.strip('\n').splitlines():
             line_elem = ET.SubElement(section, 'LINE')
             line_elem.text = line
+
+    def _apply_settings(self, device_elem, dev_info):
+        """Apply non-IOS device settings that are stored in the Packet Tracer model.
+
+        Packet Tracer PCs keep their IPv4 values on the first wired PORT rather
+        than in RUNNINGCONFIG.  Keeping this small adapter here lets scenarios
+        provide an answer snapshot with a genuinely configured PC while the
+        activity wrapper can still clear router/switch CLI configuration for
+        the learner.
+        """
+        settings = dev_info.get('settings') or {}
+        if not settings:
+            return
+        device_type = dev_info.get('type', '').lower()
+        if not device_type.startswith('pc'):
+            return
+        engine = device_elem.find('ENGINE')
+        if engine is None:
+            return
+        port = None
+        for candidate in engine.findall('.//PORT'):
+            port_type = (candidate.findtext('TYPE') or '').lower()
+            if 'copper' in port_type or 'fastethernet' in port_type:
+                port = candidate
+                break
+        if port is None:
+            return
+        field_map = {
+            'ip_address': 'IP',
+            'subnet_mask': 'SUBNET',
+            'default_gateway': 'PORT_GATEWAY',
+            'dns_server': 'PORT_DNS',
+        }
+        for key, tag in field_map.items():
+            if key not in settings:
+                continue
+            element = port.find(tag)
+            if element is None:
+                element = ET.SubElement(port, tag)
+            element.text = str(settings[key])
+        if 'dhcp' in settings:
+            element = port.find('PORT_DHCP_ENABLE')
+            if element is None:
+                element = ET.SubElement(port, 'PORT_DHCP_ENABLE')
+            element.text = 'true' if settings['dhcp'] else 'false'

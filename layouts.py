@@ -389,6 +389,92 @@ def _static_routing_lab(lab, params, rng):
     lab.add_link(host_b, 'FastEthernet0', switch_b, 'GigabitEthernet1/0/5', length='6')
 
 
+def _exercise_1_static_routing_lab(lab, params, rng):
+    """Two-router, two-PC topology used by the first guided activity.
+
+    The hosts connect directly to the routers so the exercise concentrates on
+    IPv4 addressing and static routing without adding switch configuration to
+    the first activity.
+    """
+    router_a_config = f"""!
+version 15.4
+no service timestamps log datetime msec
+no service timestamps debug datetime msec
+no service password-encryption
+!
+hostname R1
+!
+interface GigabitEthernet0/0/0
+ ip address {params['left_router_ip']} 255.255.255.0
+ no shutdown
+!
+interface GigabitEthernet0/0/1
+ ip address {params['transit_left_ip']} 255.255.255.252
+ no shutdown
+!
+ip route {params['right_lan_cidr'].split('/')[0]} 255.255.255.0 {params['transit_right_ip']}
+!
+end
+"""
+    router_b_config = f"""!
+version 15.4
+no service timestamps log datetime msec
+no service timestamps debug datetime msec
+no service password-encryption
+!
+hostname R2
+!
+interface GigabitEthernet0/0/0
+ ip address {params['right_router_ip']} 255.255.255.0
+ no shutdown
+!
+interface GigabitEthernet0/0/1
+ ip address {params['transit_right_ip']} 255.255.255.252
+ no shutdown
+!
+ip route {params['left_lan_cidr'].split('/')[0]} 255.255.255.0 {params['transit_left_ip']}
+!
+end
+"""
+
+    router_a = lab.add_device('R1', 'router', position=(300, 170), profile=None)
+    router_b = lab.add_device('R2', 'router', position=(760, 170), profile=None)
+    # Store the complete answer configuration on the normal generated XML.
+    lab._device_lookup[router_a]['profile'] = {
+        'device_type': 'router',
+        'running_config': router_a_config,
+        'startup_config': router_a_config,
+    }
+    lab._device_lookup[router_b]['profile'] = {
+        'device_type': 'router',
+        'running_config': router_b_config,
+        'startup_config': router_b_config,
+    }
+
+    pc_a = lab.add_device(
+        'PC1', 'pc', position=(120, 430),
+        settings={
+            'ip_address': params['left_pc_ip'],
+            'subnet_mask': '255.255.255.0',
+            'default_gateway': params['left_router_ip'],
+            'dhcp': False,
+        },
+    )
+    pc_b = lab.add_device(
+        'PC2', 'pc', position=(940, 430),
+        settings={
+            'ip_address': params['right_pc_ip'],
+            'subnet_mask': '255.255.255.0',
+            'default_gateway': params['right_router_ip'],
+            'dhcp': False,
+        },
+    )
+
+    lab.add_link(pc_a, 'FastEthernet0', router_a, 'GigabitEthernet0/0/0', length='7')
+    lab.add_link(router_a, 'GigabitEthernet0/0/1', router_b, 'GigabitEthernet0/0/1', length='8')
+    lab.add_link(router_b, 'GigabitEthernet0/0/0', pc_b, 'FastEthernet0', length='7')
+
+
 def _etherchannel_lab(lab, params, rng):
     switch_a = _add_positioned_device(lab, 'SwitchA', 'switch', (260, 220), profile='edge_access_vlan10_20')
     switch_b = _add_positioned_device(lab, 'SwitchB', 'switch', (520, 220), profile='edge_access_vlan10_20')

@@ -1,4 +1,14 @@
-examples
+examples/*
+!examples/activity_initial.example.json
 .venv
 __pycache__
 *.pyc
+
+# Runtime/cache files
+__pycache__/
+*.py[cod]
+
+# Generated labs and local Packet Tracer test artifacts are kept locally,
+# but are not source/template files.
+generated/
+tests/artifacts/

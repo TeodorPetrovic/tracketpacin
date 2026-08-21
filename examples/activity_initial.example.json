@@ -1,0 +1,9 @@
+{
+  "*": {
+    "clear_startup_config": true
+  },
+  "OSPFRouterA": {
+    "running_config": "!\nversion 17.6.3\n!\nhostname OSPFRouterA\n!\ninterface GigabitEthernet0/0/0\n description Student starting point\n!\nend",
+    "startup_config": ""
+  }
+}
