@@ -1122,10 +1122,16 @@ PROFILE_LIBRARY = {
 
 def _discover_template_sources():
     base_dir = os.path.dirname(__file__)
-    patterns = [
-        os.path.join(base_dir, 'examples', '*.xml'),
-        os.path.join(base_dir, 'examples', 'more', '*.xml'),
-    ]
+    roots = [os.path.join(base_dir, 'templates', 'packettracer'),
+             base_dir, os.path.join(base_dir, 'examples')]
+    patterns = []
+    for root in roots:
+        patterns.extend([
+            os.path.join(root, '*_source.xml'),
+            os.path.join(root, '*_template.xml'),
+            os.path.join(root, '**', '*_source.xml'),
+            os.path.join(root, '**', '*_template.xml'),
+        ])
     sources = []
     for pattern in patterns:
         sources.extend(glob.glob(pattern))
@@ -1133,6 +1139,8 @@ def _discover_template_sources():
 
 
 EXTRA_TEMPLATE_SOURCES = [
+    os.path.join('templates', 'packettracer', 'test.xml'),
+    os.path.join('templates', 'packettracer', 'router_8200_source.xml'),
     os.path.join('examples', 'DHCPbasicAnswers.xml'),
     os.path.join('examples', 'DHCPwithVLANsAnswers.xml'),
     os.path.join('examples', 'SubnettingLab2Answers.xml'),
@@ -1313,7 +1321,9 @@ class Lab:
 
     def to_packettracer_xml(self, path):
         """Clone devices from test.xml so every generated file matches PT 8.2 layout."""
-        template_path = os.path.join(os.path.dirname(__file__), 'test.xml')
+        template_path = os.path.join(os.path.dirname(__file__), 'templates', 'packettracer', 'test.xml')
+        if not os.path.exists(template_path):
+            template_path = os.path.join(os.path.dirname(__file__), 'test.xml')
         if not os.path.exists(template_path):
             raise FileNotFoundError('test.xml not found; place a Packet Tracer 8.2 file next to this script.')
 
@@ -1383,7 +1393,9 @@ class Lab:
         print(f'Packet Tracer XML written to {path} using templates from test.xml')
 
     def _load_template_map(self):
-        template_path = os.path.join(os.path.dirname(__file__), 'test.xml')
+        template_path = os.path.join(os.path.dirname(__file__), 'templates', 'packettracer', 'test.xml')
+        if not os.path.exists(template_path):
+            template_path = os.path.join(os.path.dirname(__file__), 'test.xml')
         if not os.path.exists(template_path):
             raise FileNotFoundError('test.xml not found; place a Packet Tracer 8.2 file next to this script.')
         tree = ET.parse(template_path)
@@ -3779,7 +3791,8 @@ def main():
     parser.add_argument('-s', '--scenario', action='append', dest='scenarios', help='Scenario name to include (repeatable).')
     parser.add_argument('-r', '--random', type=int, metavar='N', help='Append N random non-repeating scenarios.')
     parser.add_argument('--seed', type=int, help='Seed for the random scenario picker.')
-    parser.add_argument('-o', '--output', default='generated_lab.xml', help='Destination Packet Tracer XML path.')
+    parser.add_argument('-o', '--output', default=os.path.join('generated', 'generated_lab.xml'),
+                        help='Destination Packet Tracer XML path (defaults under generated/).')
     parser.add_argument('--list', action='store_true', help='List available scenarios and exit.')
     parser.add_argument('--list-topics', action='store_true', help='List available CCNA topics and exit.')
     parser.add_argument('--topics', action='append', help='Add one scenario per topic (repeatable or comma-separated).')

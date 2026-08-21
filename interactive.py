@@ -256,9 +256,9 @@ def _screen_configure(selected_keys, entries):
 
     # Output
     default_name = ordered[0] if len(ordered) == 1 else 'generated_lab'
-    output_pkt = _prompt('Output .pkt filename', f'{default_name}.pkt')
+    output_pkt = _prompt('Output .pkt filename', os.path.join('generated', f'{default_name}.pkt'))
     if not output_pkt:
-        output_pkt = f'{default_name}.pkt'
+        output_pkt = os.path.join('generated', f'{default_name}.pkt')
     if not output_pkt.lower().endswith('.pkt'):
         output_pkt += '.pkt'
 
@@ -317,6 +317,8 @@ def _screen_configure(selected_keys, entries):
     lab.set_instruction_note_text(note_text)
 
     try:
+        output_dir = os.path.dirname(os.path.abspath(output_xml))
+        os.makedirs(output_dir, exist_ok=True)
         lab.to_packettracer_xml(output_xml)
         _success(f'XML  → {output_xml}')
     except Exception as exc:

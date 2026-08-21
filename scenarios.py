@@ -261,6 +261,21 @@ def params_static_routing(ctx: ParameterContext):
     }
 
 
+def params_exercise_1(ctx: ParameterContext):
+    """Stable addressing plan for the first learner-facing activity."""
+    return {
+        'left_lan_cidr': '192.168.10.0/24',
+        'right_lan_cidr': '192.168.20.0/24',
+        'transit_cidr': '10.0.0.0/30',
+        'left_router_ip': '192.168.10.1',
+        'right_router_ip': '192.168.20.1',
+        'left_pc_ip': '192.168.10.10',
+        'right_pc_ip': '192.168.20.10',
+        'transit_left_ip': '10.0.0.1',
+        'transit_right_ip': '10.0.0.2',
+    }
+
+
 def params_etherchannel(ctx: ParameterContext):
     pool = ctx.pool
     mgmt_net = pool.allocate_network(mask=24, first_octet=10)
@@ -448,6 +463,11 @@ def scenario_portfast_bpduguard(lab, params, ctx=None):
 def scenario_static_routing(lab, params, ctx=None):
     rng = _ctx_rng(ctx)
     layouts._static_routing_lab(lab, params, rng)
+
+
+def scenario_exercise_1(lab, params, ctx=None):
+    rng = _ctx_rng(ctx)
+    layouts._exercise_1_static_routing_lab(lab, params, rng)
 
 
 def scenario_etherchannel(lab, params, ctx=None):
@@ -792,6 +812,33 @@ SCENARIO_LIBRARY = {
         ),
         'builder': scenario_static_routing,
         'param_generator': params_static_routing,
+    },
+    'exercise_1': {
+        'title': 'Exercise 1 - Static Routing Between Two Routers',
+        'description': (
+            'Configure R1 and R2 with LANs {left_lan_cidr} and {right_lan_cidr}, '
+            'then route between them over {transit_cidr}.'
+        ),
+        'tags': ['routing', 'static_routing', 'beginner'],
+        'topics': ['static_routing', 'routing'],
+        'objectives': [
+            'Configure R1 G0/0/0 as {left_router_ip}/24 and R1 G0/0/1 as {transit_left_ip}/30.',
+            'Configure R2 G0/0/0 as {right_router_ip}/24 and R2 G0/0/1 as {transit_right_ip}/30.',
+            'Configure PC1 as {left_pc_ip}/24 with default gateway {left_router_ip}.',
+            'Configure PC2 as {right_pc_ip}/24 with default gateway {right_router_ip}.',
+            'Add a static route on R1 to {right_lan_cidr} via {transit_right_ip}.',
+            'Add a static route on R2 to {left_lan_cidr} via {transit_left_ip}.',
+            'Verify end-to-end connectivity by pinging PC2 from PC1.',
+        ],
+        'objective_sample_min': 7,
+        'objective_sample_max': 7,
+        'instructions': (
+            'Configure the two routers and two PCs from the three instruction tabs. '
+            'The learner snapshot starts with blank router configurations and the '
+            'activity assessment checks the addressing, routes, and device settings.'
+        ),
+        'builder': scenario_exercise_1,
+        'param_generator': params_exercise_1,
     },
     'etherchannel_lacp': {
         'title': 'EtherChannel (LACP)',
@@ -1356,6 +1403,11 @@ def derive_pkt_path(output_path):
     return f'{base}.pkt'
 
 
+def derive_activity_path(output_path):
+    base, _ = os.path.splitext(output_path)
+    return f'{base}.pka'
+
+
 def encode_pkt(xml_path, pkt_path, legacy=False):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     ptexplorer_path = os.path.join(script_dir, 'ptexplorer.py')
@@ -1366,3 +1418,29 @@ def encode_pkt(xml_path, pkt_path, legacy=False):
         cmd.append('--legacy')
     subprocess.run(cmd, check=True)
     print(f'Packet Tracer PKT written to {pkt_path}')
+
+
+def decode_pkt(pkt_path, xml_path, legacy=False):
+    """Decode an existing PKT into normal XML for use as an answer network."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    ptexplorer_path = os.path.join(script_dir, 'ptexplorer.py')
+    if not os.path.exists(ptexplorer_path):
+        raise FileNotFoundError('ptexplorer.py not found alongside lab_model.py; PKT import is unavailable.')
+    cmd = [sys.executable, ptexplorer_path, '-d', pkt_path, xml_path]
+    if legacy:
+        cmd.append('--legacy')
+    subprocess.run(cmd, check=True)
+    print(f'Packet Tracer answer network decoded to {xml_path}')
+
+
+def encode_activity(xml_path, activity_path, legacy=False):
+    """Encrypt an activity XML into a Packet Tracer PKA file."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    ptexplorer_path = os.path.join(script_dir, 'ptexplorer.py')
+    if not os.path.exists(ptexplorer_path):
+        raise FileNotFoundError('ptexplorer.py not found alongside activity.py; PKA export is unavailable.')
+    cmd = [sys.executable, ptexplorer_path, '-e', xml_path, activity_path]
+    if legacy:
+        cmd.append('--legacy')
+    subprocess.run(cmd, check=True)
+    print(f'Packet Tracer PKA written to {activity_path}')
